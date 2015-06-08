@@ -10,7 +10,7 @@ if [ ! -x "`which wget 2>/dev/null`" ];then
         exit 2
 fi
 mkdir -p /tmp/builddir/nginx-$NGINX_VERSION
-cp -r . /tmp/builddir/nginx-$NGINX_VERSION/nginx-parallel-module-$KALTURA_NGINX_VOD_VERSION
+cp -r . /tmp/builddir/nginx-$NGINX_VERSION/nginx-parallel-module
 cd /tmp/builddir
 wget $NGINX_URI -O kaltura-nginx-$NGINX_VERSION.tar.gz
 tar zxvf kaltura-nginx-$NGINX_VERSION.tar.gz
@@ -53,6 +53,6 @@ export LD_LIBRARY_PATH LIBRARY_PATH C_INCLUDE_PATH
         --with-ipv6 \
         --with-debug \
 	--with-threads \
-        --add-module=./nginx-parallel-module-$KALTURA_NGINX_PARALLEL_VERSION \
+        --add-module=./nginx-parallel-module \
         $*
 make
