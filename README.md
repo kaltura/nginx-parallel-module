@@ -1,4 +1,4 @@
-# Parallel module for Nginx
+# Parallel module for Nginx [![Build Status](https://travis-ci.org/kaltura/nginx-parallel-module.svg?branch=master)](https://travis-ci.org/kaltura/nginx-parallel-module)
 
 Reads data from an upstream-backed nginx location by running several concurrent range requests.
 
