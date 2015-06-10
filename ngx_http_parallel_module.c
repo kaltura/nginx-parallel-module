@@ -1,7 +1,10 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <ngx_md5.h>
 #include <nginx.h>
+
+#include "ngx_fixed_buffer_cache.h"
 
 // macros
 #define DIV_CEIL(nom, denom) (((nom) + (denom) - 1) / (denom))
@@ -25,9 +28,7 @@ typedef struct {
 	ngx_uint_t max_buffer_count;
 	ngx_flag_t consistency_check_etag;
 	ngx_flag_t consistency_check_last_modified;
-
-	// derived
-	size_t initial_requested_size;
+	ngx_shm_zone_t* content_length_cache_zone;
 } ngx_http_parallel_loc_conf_t;
 
 typedef struct ngx_http_parallel_fiber_ctx_s {
@@ -44,15 +45,21 @@ typedef struct {
 	ngx_str_t sr_uri;
 	ngx_http_headers_in_t original_headers_in;
 	ngx_http_range_t range;
-	ngx_flag_t proxy_as_is;
+	ngx_uint_t fiber_count;			// fiber_count == 1 means that the request is proxied as is
+	off_t cached_response_length;
+
+	ngx_flag_t key_inited;
+	u_char key[NGX_FIXED_BUFFER_CACHE_KEY_SIZE];
 
 	ngx_chain_t** chunks;
 	uint64_t chunk_count;
 	uint64_t missing_chunks;		// a bitmask of chunks that returned 416
 	uint64_t next_send_chunk;		// next chunk to send to the client
 	uint64_t next_request_chunk;	// next chunk to request from upstream
+	size_t initial_chunk_size;
 	size_t chunk_size;
 	size_t last_chunk_size;
+	size_t initial_requested_size;
 
 	ngx_chain_t *free;				// list of free buffers
 	ngx_chain_t *busy;				// list of busy buffers (being sent to client)
@@ -73,7 +80,10 @@ typedef struct {
 // forward declarations
 static ngx_int_t ngx_http_parallel_subrequest_finished_handler(
 	ngx_http_request_t *r, void *data, ngx_int_t rc);
-static char *ngx_http_parallel(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_parallel_command(
+	ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_parallel_cache_command(
+	ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_parallel_filter_init(ngx_conf_t *cf);
 static void *ngx_http_parallel_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_parallel_merge_loc_conf(
@@ -88,7 +98,7 @@ static ngx_command_t ngx_http_parallel_commands[] = {
 
 	{ ngx_string("parallel"), 
 	NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
-	ngx_http_parallel,
+	ngx_http_parallel_command,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	0,
 	NULL},
@@ -140,6 +150,13 @@ static ngx_command_t ngx_http_parallel_commands[] = {
 	ngx_conf_set_flag_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_parallel_loc_conf_t, consistency_check_last_modified),
+	NULL },
+
+	{ ngx_string("parallel_content_length_cache"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12,
+	ngx_http_parallel_cache_command,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_parallel_loc_conf_t, content_length_cache_zone),
 	NULL },
 
 	ngx_null_command
@@ -632,7 +649,7 @@ ngx_http_parallel_start_fiber(
 
 	if (cl->buf->start == NULL)
 	{
-		alloc_size = conf->max_chunk_size + conf->max_headers_size;
+		alloc_size = conf->max_headers_size + conf->max_chunk_size;
 		b->start = ngx_palloc(r->pool, alloc_size);
 		if (b->start == NULL) 
 		{
@@ -660,17 +677,17 @@ ngx_http_parallel_start_fiber(
 	}
 
 	// set the range
-	if (!ctx->proxy_as_is)
+	if (ctx->fiber_count != 1)
 	{
 		start_offset = ctx->range.start;
-		if (chunk_index < conf->fiber_count)
+		if (chunk_index < ctx->fiber_count)
 		{
 			start_offset += chunk_index * ctx->chunk_size;
 		}
 		else
 		{
-			start_offset += conf->initial_requested_size + 
-				(chunk_index - conf->fiber_count) * ctx->chunk_size;
+			start_offset += ctx->initial_requested_size +
+				(chunk_index - ctx->fiber_count) * ctx->chunk_size;
 		}
 
 		end_offset = start_offset + ctx->chunk_size;
@@ -755,6 +772,22 @@ ngx_http_parallel_start_fibers(
 	return NGX_OK;
 }
 
+static void
+ngx_http_parallel_calculate_key(
+	u_char* key,
+	ngx_http_request_t *r)
+{
+	ngx_md5_t md5;
+
+	ngx_md5_init(&md5);
+	if (r->headers_in.host != NULL)
+	{
+		ngx_md5_update(&md5, r->headers_in.host->value.data, r->headers_in.host->value.len);
+	}
+	ngx_md5_update(&md5, r->uri.data, r->uri.len);
+	ngx_md5_final(key, &md5);
+}
+
 static ngx_int_t 
 ngx_http_parallel_init_chunks(
 	ngx_http_parallel_ctx_t *ctx,
@@ -770,7 +803,7 @@ ngx_http_parallel_init_chunks(
 	off_t content_length;
 	ngx_int_t rc;
 
-	// find the content length
+	// find the instance length
 	content_range = ngx_http_parallel_header_get_value(
 		&headers_out->headers, 
 		&content_range_name, 
@@ -790,6 +823,25 @@ ngx_http_parallel_init_chunks(
 		return NGX_HTTP_BAD_GATEWAY;
 	}
 
+	conf = ngx_http_get_module_loc_conf(r, ngx_http_parallel_module);
+
+	// update cache
+	if (conf->content_length_cache_zone != NULL && 
+		instance_length != ctx->cached_response_length)
+	{
+		if (!ctx->key_inited)
+		{
+			ngx_http_parallel_calculate_key(ctx->key, r);
+		}
+
+		ngx_fixed_buffer_cache_store(
+			conf->content_length_cache_zone, 
+			ctx->key, 
+			(u_char*)&instance_length, 
+			1);
+	}
+
+	// find the content length
 	content_length = instance_length;
 
 	if (ctx->range.end != 0 && ctx->range.end < content_length)
@@ -809,9 +861,7 @@ ngx_http_parallel_init_chunks(
 	content_length -= ctx->range.start;
 
 	// find the chunk size and count
-	conf = ngx_http_get_module_loc_conf(r, ngx_http_parallel_module);
-
-	if (content_length <= (off_t)conf->initial_requested_size)
+	if (content_length <= (off_t)ctx->initial_requested_size)
 	{
 		ctx->chunk_count = DIV_CEIL(content_length, ctx->chunk_size);
 		ctx->last_chunk_size = content_length + ctx->chunk_size - 
@@ -819,20 +869,23 @@ ngx_http_parallel_init_chunks(
 	}
 	else
 	{
-		remaining_length = content_length - conf->initial_requested_size;
-		ctx->chunk_size = DIV_CEIL(remaining_length, conf->fiber_count);
-		if (ctx->chunk_size < conf->min_chunk_size)
+		remaining_length = content_length - ctx->initial_requested_size;
+		if (remaining_length <= (off_t)(ctx->fiber_count * conf->min_chunk_size))
 		{
 			ctx->chunk_size = conf->min_chunk_size;
 		}
-		else if (ctx->chunk_size > conf->max_chunk_size)
+		else if (remaining_length >= (off_t)(ctx->fiber_count * conf->max_chunk_size))
 		{
 			ctx->chunk_size = conf->max_chunk_size;
+		}
+		else
+		{
+			ctx->chunk_size = DIV_CEIL(remaining_length, ctx->fiber_count);
 		}
 		ctx->chunk_count = DIV_CEIL(remaining_length, ctx->chunk_size);
 		ctx->last_chunk_size = remaining_length + ctx->chunk_size - 
 			ctx->chunk_count * ctx->chunk_size;
-		ctx->chunk_count += conf->fiber_count;
+		ctx->chunk_count += ctx->fiber_count;
 	}
 
 	ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1179,9 +1232,28 @@ ngx_http_parallel_handle_request_complete(
 	*b = u->buffer;
 	b->last = b->pos + u->state->response_length;
 
+	conf = ngx_http_get_module_loc_conf(pr, ngx_http_parallel_module);
+
 	if (r->headers_out.status != NGX_HTTP_PARTIAL_CONTENT || 
-		ctx->proxy_as_is)
+		ctx->fiber_count == 1)
 	{
+		// save the content length to cache
+		if (r->headers_out.status != NGX_HTTP_PARTIAL_CONTENT && 
+			ctx->cached_response_length != r->headers_out.content_length_n &&
+			conf->content_length_cache_zone != NULL)
+		{
+			if (!ctx->key_inited)
+			{
+				ngx_http_parallel_calculate_key(ctx->key, r);
+			}
+
+			ngx_fixed_buffer_cache_store(
+				conf->content_length_cache_zone,
+				ctx->key,
+				(u_char*)&r->headers_out.content_length_n,
+				1);
+		}
+
 		// copy the response headers from upstream
 		pr->headers_out = r->headers_out;
 
@@ -1216,8 +1288,6 @@ ngx_http_parallel_handle_request_complete(
 	}
 
 	// initialize the chunks array (on first completed chunk)
-	conf = ngx_http_get_module_loc_conf(pr, ngx_http_parallel_module);
-
 	if (ctx->chunks == NULL)
 	{
 		rc = ngx_http_parallel_init_chunks(ctx, pr, &r->headers_out);
@@ -1248,9 +1318,9 @@ ngx_http_parallel_handle_request_complete(
 	{
 		expected_size = ctx->last_chunk_size;
 	}
-	else if (fiber->chunk_index < conf->fiber_count)
+	else if (fiber->chunk_index < ctx->fiber_count)
 	{
-		expected_size = conf->min_chunk_size;
+		expected_size = ctx->initial_chunk_size;
 	}
 	else
 	{
@@ -1406,8 +1476,13 @@ ngx_http_parallel_handler(ngx_http_request_t *r)
 	ngx_uint_t header_in_count;
 	ngx_uint_t fiber_count;
 	ngx_uint_t i;
+	ngx_flag_t key_inited = 0;
 	ngx_int_t rc;
+	u_char key[NGX_FIXED_BUFFER_CACHE_KEY_SIZE];
+	size_t initial_chunk_size;
 	u_char* p;
+	off_t cached_response_length = -1;
+	off_t expected_response_length = -1;
 
 	// validate method
 	if (!(r->method & (NGX_HTTP_GET | NGX_HTTP_HEAD)))
@@ -1428,10 +1503,11 @@ ngx_http_parallel_handler(ngx_http_request_t *r)
 		return rc;
 	}
 
-	// get fiber count
+	// get fiber count and initial chunk size
 	conf = ngx_http_get_module_loc_conf(r, ngx_http_parallel_module);
 
 	fiber_count = conf->fiber_count;
+	initial_chunk_size = conf->min_chunk_size;
 
 	if (r->method == NGX_HTTP_HEAD)
 	{
@@ -1452,11 +1528,52 @@ ngx_http_parallel_handler(ngx_http_request_t *r)
 		{
 			range.is_range_request = 1;
 
-			if (range.end != 0 && 
-				range.end - range.start < (off_t)conf->initial_requested_size)
+			if (range.end != 0)
 			{
-				fiber_count = DIV_CEIL(range.end - range.start, conf->min_chunk_size);
+				expected_response_length = range.end - range.start;
 			}
+		}
+	}
+
+	if (expected_response_length < 0 && 
+		fiber_count != 1 && 
+		conf->content_length_cache_zone != NULL)
+	{
+		key_inited = 1;
+
+		ngx_http_parallel_calculate_key(key, r);
+
+		ngx_fixed_buffer_cache_fetch(
+			conf->content_length_cache_zone,
+			key,
+			(u_char*)&cached_response_length);
+		expected_response_length = cached_response_length;
+	}
+
+	if (expected_response_length >= 0)
+	{
+		// optimize the initial chunk size according to the response length
+		if (expected_response_length <= (off_t)(fiber_count * conf->min_chunk_size))
+		{
+			initial_chunk_size = conf->min_chunk_size;
+		}
+		else if (expected_response_length >= (off_t)(fiber_count * conf->max_chunk_size))
+		{
+			initial_chunk_size = conf->max_chunk_size;
+		}
+		else
+		{
+			initial_chunk_size = DIV_CEIL(expected_response_length, fiber_count);
+		}
+
+		// optimize the fiber count according to the response length
+		if (expected_response_length == 0)
+		{
+			fiber_count = 1;
+		}
+		else if (expected_response_length < (off_t)(fiber_count * initial_chunk_size))
+		{
+			fiber_count = DIV_CEIL(expected_response_length, initial_chunk_size);
 		}
 	}
 
@@ -1470,9 +1587,17 @@ ngx_http_parallel_handler(ngx_http_request_t *r)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	}
 	ctx->error_code = NGX_AGAIN;
-	ctx->chunk_size = conf->min_chunk_size;
+	ctx->initial_chunk_size = initial_chunk_size;
+	ctx->chunk_size = initial_chunk_size;
 	ctx->range = range;
-	ctx->proxy_as_is = fiber_count == 1;
+	ctx->fiber_count = fiber_count;
+	ctx->initial_requested_size = fiber_count * initial_chunk_size;
+	ctx->cached_response_length = cached_response_length;
+	if (key_inited)
+	{
+		ngx_memcpy(ctx->key, key, sizeof(ctx->key));
+		ctx->key_inited = 1;
+	}
 	
 	ngx_http_set_ctx(r, ctx, ngx_http_parallel_module);
 	
@@ -1497,7 +1622,7 @@ ngx_http_parallel_handler(ngx_http_request_t *r)
 	for (i = 0; i < fiber_count; i++)
 	{
 		rc = ngx_http_parallel_init_fiber(
-			r, header_in_count, ctx->proxy_as_is, &ctx->fibers[i]);
+			r, header_in_count, fiber_count == 1, &ctx->fibers[i]);
 		if (rc != NGX_OK)
 		{
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -1554,7 +1679,10 @@ ngx_http_parallel_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	ngx_conf_merge_value(conf->consistency_check_etag, prev->consistency_check_etag, 1);
 	ngx_conf_merge_value(conf->consistency_check_last_modified, prev->consistency_check_last_modified, 1);
 
-	conf->initial_requested_size = conf->min_chunk_size * conf->fiber_count;
+	if (conf->content_length_cache_zone == NULL)
+	{
+		conf->content_length_cache_zone = prev->content_length_cache_zone;
+	}
 
 	if (conf->min_chunk_size > conf->max_chunk_size)
 	{
@@ -1579,7 +1707,7 @@ ngx_http_parallel_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
 
 static char *
-ngx_http_parallel(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ngx_http_parallel_command(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_core_loc_conf_t *clcf;
 	ngx_str_t        *field, *value;
@@ -1600,6 +1728,53 @@ ngx_http_parallel(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 	*field = value[1];
 
     return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_parallel_cache_command(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+	ngx_shm_zone_t **zone = (ngx_shm_zone_t **)((u_char*)conf + cmd->offset);
+	ngx_str_t  *value;
+	ssize_t size;
+
+	value = cf->args->elts;
+
+	if (*zone != NULL)
+	{
+		return "is duplicate";
+	}
+
+	if (ngx_strcmp(value[1].data, "off") == 0)
+	{
+		*zone = NULL;
+		return NGX_CONF_OK;
+	}
+
+	if (cf->args->nelts < 3)
+	{
+		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+			"size not specified in \"%V\"", &cmd->name);
+		return NGX_CONF_ERROR;
+	}
+
+	size = ngx_parse_size(&value[2]);
+	if (size == NGX_ERROR)
+	{
+		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+			"invalid size %V", &value[2]);
+		return NGX_CONF_ERROR;
+	}
+
+	*zone = ngx_fixed_buffer_cache_create_zone(cf, &value[1], size, 
+		sizeof(off_t), &ngx_http_parallel_module);
+	if (*zone == NULL)
+	{
+		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+			"failed to create cache zone");
+		return NGX_CONF_ERROR;
+	}
+
+	return NGX_CONF_OK;
 }
 
 static ngx_int_t
